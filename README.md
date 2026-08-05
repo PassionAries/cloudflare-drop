@@ -9,7 +9,7 @@
 
 ## 自动部署
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/oustn/cloudflare-drop)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/PassionAries/cloudflare-drop)
 
 1. 点击按钮，跳转到自动部署页面
 2. 根据页面指引，关联 GitHub & Cloudflare，配置 Cloudflare Account ID & API Key
