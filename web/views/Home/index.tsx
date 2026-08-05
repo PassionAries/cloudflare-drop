@@ -1,4 +1,5 @@
 import { useState, useRef } from 'preact/hooks'
+import { observer } from 'mobx-react-lite'
 import { useDialogs } from '@toolpad/core/useDialogs'
 import Container from '@mui/material/Container'
 import Paper from '@mui/material/Paper'
@@ -33,6 +34,9 @@ import {
 } from './components'
 import { resolveFileByCode, uploadFile } from '../../api'
 import { Layout, LayoutProps } from '../../components'
+import { mapError } from '../../helpers'
+import { useTranslation } from '../../i18n'
+import { hasDroppedFolder } from './fileDrop'
 
 const VisuallyHiddenInput = styled('input')({
   clip: 'rect(0 0 0 0)',
@@ -49,9 +53,15 @@ const VisuallyHiddenInput = styled('input')({
 const envMax = Number.parseInt(import.meta.env.SHARE_MAX_SIZE_IN_MB, 10)
 const MAX_SIZE = Number.isNaN(envMax) || envMax <= 0 ? 10 : envMax
 
-export function AppMain(props: LayoutProps) {
+function blurActiveElement() {
+  const activeElement = document.activeElement
+  if (activeElement instanceof HTMLElement) activeElement.blur()
+}
+
+export const AppMain = observer(function AppMain(props: LayoutProps) {
   const setBackdropOpen = props.setBackdropOpen!
   const message = props.message!
+  const i18n = useTranslation()
   const [tab, setTab] = useState('text')
   const dialogs = useDialogs()
   const [duration, updateDuration] = useState('')
@@ -64,6 +74,7 @@ export function AppMain(props: LayoutProps) {
   const [password, updatePassword] = useState('')
 
   const toggleDrawer = (newOpen: boolean) => () => {
+    if (newOpen) blurActiveElement()
     updateDrawerOpened(newOpen)
   }
 
@@ -93,7 +104,10 @@ export function AppMain(props: LayoutProps) {
 
   const [text, setText] = useState('')
   const [file, setFile] = useState<File | null>(null)
+  const [isFileDragging, setFileDragging] = useState(false)
   const [code, setCode] = useState('')
+  const resolvingCode = useRef<string | null>(null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
 
   const reset = useRef(() => {
     setText('')
@@ -107,13 +121,15 @@ export function AppMain(props: LayoutProps) {
 
   const handleResolveFile = useRef(async (code: string) => {
     if (!code || code.length !== 6) return
+    if (resolvingCode.current === code) return
+    resolvingCode.current = code
     setCode(code)
     handleBackdropOpen()
     try {
       const data = await resolveFileByCode(code)
       handleBackdropClose()
       if (!data.result || !data.data) {
-        message.error(data.message)
+        message.error(mapError(data.message))
         return
       }
       // 打开弹窗
@@ -121,13 +137,15 @@ export function AppMain(props: LayoutProps) {
         data.data.code,
         data.data.type !== 'plain/string',
       )
+      blurActiveElement()
       await dialogs
         .open(FileDialog, { ...data.data, message })
         .then(reset.current)
     } catch (e) {
-      const data = (e as { message: string }).message || JSON.stringify(e)
-      message.error(data)
+      message.error(mapError(e))
       handleBackdropClose()
+    } finally {
+      resolvingCode.current = null
     }
   })
 
@@ -137,15 +155,54 @@ export function AppMain(props: LayoutProps) {
     setFile(null)
   }
 
+  const selectFile = (file: File | null) => {
+    if (file && file.size > MAX_SIZE * 1000 * 1000) {
+      message.error(i18n.t('home.fileTooLarge', { size: MAX_SIZE }))
+      return false
+    }
+    setFile(file)
+    return true
+  }
+
   const handleFileChange = (e: InputEvent) => {
     const target: HTMLInputElement = e.target as HTMLInputElement
     const file = target?.files?.[0] ?? null
-    if (file && file.size > MAX_SIZE * 1000 * 1000) {
-      message.error(`文件大于 ${MAX_SIZE}M`)
-      ;(e.target as HTMLInputElement).value = ''
+    if (!selectFile(file)) target.value = ''
+  }
+
+  const handleFileDragOver = (event: Event) => {
+    event.preventDefault()
+    const dragEvent = event as DragEvent
+    if (hasDroppedFolder(dragEvent.dataTransfer)) {
+      if (dragEvent.dataTransfer) dragEvent.dataTransfer.dropEffect = 'none'
+      setFileDragging(false)
       return
     }
-    setFile(file)
+    if (dragEvent.dataTransfer) dragEvent.dataTransfer.dropEffect = 'copy'
+    setFileDragging(true)
+  }
+
+  const handleFileDragLeave = (event: Event) => {
+    event.preventDefault()
+    setFileDragging(false)
+  }
+
+  const handleFileDrop = (event: Event) => {
+    event.preventDefault()
+    setFileDragging(false)
+    const dragEvent = event as DragEvent
+    if (hasDroppedFolder(dragEvent.dataTransfer)) {
+      message.error(i18n.t('home.folderUploadNotSupported'))
+      return
+    }
+    const file = dragEvent.dataTransfer?.files?.[0] ?? null
+    if (file) selectFile(file)
+  }
+
+  const handleFileKeyDown = (event: KeyboardEvent) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return
+    event.preventDefault()
+    fileInputRef.current?.click()
   }
 
   const handleShare = async () => {
@@ -172,16 +229,16 @@ export function AppMain(props: LayoutProps) {
       )
       handleProgressClose()
       if (!uploaded.result || !uploaded.data) {
-        message.error(uploaded.message)
+        message.error(mapError(uploaded.message))
         return
       }
       historyApi.insertShared(uploaded.data.code, tab === 'file')
+      blurActiveElement()
       await dialogs
         .open(ShareDialog, { ...uploaded.data, message })
         .then(reset.current)
     } catch (e) {
-      const data = (e as { message: string }).message || JSON.stringify(e)
-      message.error(data)
+      message.error(mapError(e))
       handleProgressClose()
     }
   }
@@ -210,7 +267,7 @@ export function AppMain(props: LayoutProps) {
           >
             <InputLabel>
               <Typography variant="h4" align="left">
-                分享码：
+                {i18n.t('home.shareCode')}
               </Typography>
             </InputLabel>
             <Code
@@ -233,8 +290,8 @@ export function AppMain(props: LayoutProps) {
                   onChange={handleChangeTab}
                   aria-label="lab API tabs example"
                 >
-                  <Tab label="文本分享" value="text" />
-                  <Tab label="文件分享" value="file" />
+                  <Tab label={i18n.t('home.textShare')} value="text" />
+                  <Tab label={i18n.t('home.fileShare')} value="file" />
                 </TabList>
               </Box>
               <TabPanel value="text" sx={{ height: 230, pl: 0, pr: 0 }}>
@@ -246,30 +303,68 @@ export function AppMain(props: LayoutProps) {
                   onInput={handleTextInput}
                 />
               </TabPanel>
-              <TabPanel value="file" sx={{ height: 230, pl: 0, pr: 0, pb: 0 }}>
-                <Box className="flex">
-                  <Button
-                    className="shrink-0"
-                    component="label"
-                    role={undefined}
-                    variant="contained"
-                    tabIndex={-1}
-                    startIcon={<CloudUploadIcon />}
-                  >
-                    选择文件
-                    <VisuallyHiddenInput
-                      type="file"
-                      onChange={handleFileChange}
+              <TabPanel value="file" sx={{ height: 230, pl: 0, pr: 0 }}>
+                <Box
+                  component="label"
+                  role="button"
+                  tabIndex={0}
+                  onDragEnter={handleFileDragOver}
+                  onDragOver={handleFileDragOver}
+                  onDragLeave={handleFileDragLeave}
+                  onDrop={handleFileDrop}
+                  onKeyDown={handleFileKeyDown}
+                  sx={(theme) => ({
+                    alignItems: 'center',
+                    border: '1px dashed',
+                    borderColor: isFileDragging
+                      ? theme.palette.primary.main
+                      : theme.palette.divider,
+                    borderRadius: 2,
+                    cursor: 'pointer',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    height: '100%',
+                    justifyContent: 'center',
+                    p: 2,
+                    textAlign: 'center',
+                    transition: theme.transitions.create(
+                      ['background-color', 'border-color'],
+                      {
+                        duration: theme.transitions.duration.shortest,
+                      },
+                    ),
+                    '&:hover': {
+                      backgroundColor: theme.palette.action.hover,
+                      borderColor: theme.palette.primary.main,
+                    },
+                  })}
+                >
+                  {file ? (
+                    <FileIcon color="disabled" sx={{ mb: 1, fontSize: 36 }} />
+                  ) : (
+                    <CloudUploadIcon
+                      color={isFileDragging ? 'primary' : 'disabled'}
+                      sx={{ mb: 1, fontSize: 36 }}
                     />
-                  </Button>
-                  {file && (
-                    <div class="flex flex-col ml-2 min-w-0">
-                      <FileIcon fontSize="small" color="disabled" />
-                      <Typography color="textDisabled" noWrap lineHeight="16px">
-                        {file.name}
-                      </Typography>
-                    </div>
                   )}
+                  <Typography
+                    color={file ? 'text.primary' : 'text.secondary'}
+                    noWrap
+                    variant="body2"
+                    sx={{ maxWidth: '100%' }}
+                  >
+                    {file ? file.name : i18n.t('home.dropFileHint')}
+                  </Typography>
+                  <Typography color="textDisabled" variant="caption">
+                    {file
+                      ? `${(file.size / (1000 * 1000)).toFixed(1)}M`
+                      : i18n.t('home.dropFileSubHint')}
+                  </Typography>
+                  <VisuallyHiddenInput
+                    ref={fileInputRef}
+                    type="file"
+                    onChange={handleFileChange}
+                  />
                 </Box>
               </TabPanel>
             </TabContext>
@@ -285,7 +380,7 @@ export function AppMain(props: LayoutProps) {
                   onChange={handleChangeEphemeral}
                 />
               }
-              label="阅后即焚"
+              label={i18n.t('home.burnAfterRead')}
             />
           </Box>
           <Box className="flex flex-row-reverse justify-between">
@@ -303,11 +398,11 @@ export function AppMain(props: LayoutProps) {
                 }}
                 onClick={handleShare}
               >
-                分享
+                {i18n.t('common.share')}
               </Button>
             </div>
             <Button variant="text" color="primary" onClick={toggleDrawer(true)}>
-              历史记录
+              {i18n.t('home.history')}
               <ReceiptLongIcon fontSize="small" />
             </Button>
           </Box>
@@ -325,7 +420,7 @@ export function AppMain(props: LayoutProps) {
       <Progress open={progress !== null} value={progress ?? 0} />
     </>
   )
-}
+})
 export function Home() {
   return (
     <Layout>

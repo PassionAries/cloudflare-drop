@@ -19,8 +19,35 @@ export async function resolveFileByCode(
   return processResponse(response)
 }
 
+async function uploadEncryptedFile(
+  payload: {
+    data: Blob
+    isEphemeral: boolean
+    duration: string
+    password: string
+  },
+  onUpload?: (progressEvent: AxiosProgressEvent) => void,
+): Promise<ApiResponseType<FileUploadedType>> {
+  const { data, isEphemeral, duration, password } = payload
+  const encrypted = await Encryptor.encryptStream(password, data)
+  return Uploader.uploadStream(
+    {
+      stream: encrypted.stream,
+      size: encrypted.size,
+      plaintextSize: data.size,
+      filename: 'encrypted-file',
+      type: data.type || 'application/octet-stream',
+      hash: '',
+      duration,
+      isEphemeral,
+      isEncrypted: true,
+    },
+    onUpload,
+  )
+}
+
 export async function uploadFile(
-  fileInfo: {
+  payload: {
     data: Blob
     isEphemeral?: boolean
     duration?: string | null
@@ -28,18 +55,31 @@ export async function uploadFile(
   },
   onUpload?: (progressEvent: AxiosProgressEvent) => void,
 ): Promise<ApiResponseType<FileUploadedType>> {
-  const { data, isEphemeral = false, duration = '', password } = fileInfo
-  const formData = new FormData()
-  if (password) {
-    formData.append('file', await Encryptor.encrypt(password, data))
-    formData.append('isEncrypted', JSON.stringify(true))
-  } else {
-    formData.append('file', data)
-  }
-  formData.append('isEphemeral', JSON.stringify(isEphemeral))
-  formData.append('duration', JSON.stringify(duration))
   try {
-    return Uploader.upload(formData, onUpload)
+    const { data, isEphemeral = false, duration = '', password } = payload
+    if (password) {
+      if (data.type === 'plain/string') {
+        const formData = new FormData()
+        formData.append('file', await Encryptor.encrypt(password, data))
+        formData.append('isEphemeral', JSON.stringify(isEphemeral))
+        formData.append('duration', JSON.stringify(duration))
+        formData.append('isEncrypted', JSON.stringify(true))
+        formData.append('plaintextSize', JSON.stringify(data.size))
+        formData.append('plaintextType', data.type)
+        formData.append('hash', JSON.stringify(''))
+        return await Uploader.upload(formData, onUpload)
+      }
+      return await uploadEncryptedFile(
+        { data, isEphemeral, duration: duration ?? '', password },
+        onUpload,
+      )
+    }
+
+    const formData = new FormData()
+    formData.append('file', data)
+    formData.append('isEphemeral', JSON.stringify(isEphemeral))
+    formData.append('duration', JSON.stringify(duration))
+    return await Uploader.upload(formData, onUpload)
   } catch (e) {
     return {
       result: false,
@@ -49,18 +89,34 @@ export async function uploadFile(
   }
 }
 
+export async function fetchSharedBlob(
+  id: string,
+  token?: string,
+): Promise<Blob> {
+  const response = await fetch(`/files/${id}?token=${token}`)
+  if (!response.ok) throw new Error(await response.text())
+  return response.blob()
+}
+
+export async function decryptPlainText(
+  password: string,
+  blob: Blob,
+): Promise<string> {
+  const decrypted = await Encryptor.decryptWithMetadata(password, blob)
+  return decrypted.blob.text()
+}
+
 export async function fetchPlainText(
   id: string,
   password?: string,
   token?: string,
 ): Promise<string> {
   const response = await fetch(`/files/${id}?token=${token}`)
+  if (!response.ok) throw new Error(await response.text())
   if (!password) {
     return response.text()
   }
-  const blob = await response.blob()
-  const decryptedBlob = await Encryptor.decrypt(password, blob)
-  return decryptedBlob.text()
+  return decryptPlainText(password, await response.blob())
 }
 
 export async function fetchFile(
@@ -82,14 +138,21 @@ export async function fetchFile(
     blob = cacheFile
   }
   try {
-    const decryptedBlob = await Encryptor.decrypt(password, blob)
-    const file = new File([decryptedBlob], filename, {
-      type: decryptedBlob.type,
-    })
+    const decrypted = await Encryptor.decryptWithMetadata(password, blob)
+    const file = new File(
+      [decrypted.blob],
+      decrypted.metadata.filename || filename,
+      {
+        type: decrypted.metadata.type || decrypted.blob.type,
+      },
+    )
     const url = URL.createObjectURL(file)
     const a = document.createElement('a')
     a.href = url
-    a.download = filename
+    a.download = file.name
+    a.addEventListener('click', (event) => {
+      event.stopPropagation()
+    })
     document.body.appendChild(a)
     a.click()
 

@@ -1,239 +1,265 @@
 import axios, { AxiosProgressEvent } from 'axios'
-import { getUserUUID } from '../helpers'
 
-interface ChunkInfo {
-  sha: string
-  uuid: string
+interface UploadSession {
+  sessionId: string
+  partSize: number
+  uploadedParts: Array<{
+    partNumber: number
+    etag?: string
+    objectId?: string
+  }>
+}
+
+interface UploadSessionCreatePayload {
+  filename: string
+  type: string
   size: number
-  chunks: Array<{
-    chunkId: number
-    size: number
-  }>
-  finished: Array<{
-    chunkId: number
-    objectId: string
-  }>
+  plaintextSize?: number
+  hash: string
+  duration: string
+  isEphemeral: boolean
+  isEncrypted: boolean
 }
 
 type UploadCallback = { (progressEvent: AxiosProgressEvent): void }
 
+interface StreamUploadPayload extends UploadSessionCreatePayload {
+  stream: ReadableStream<Uint8Array>
+}
+
+function parseJsonField<T>(value: FormDataEntryValue | null, fallback: T): T {
+  if (typeof value !== 'string' || !value) return fallback
+  try {
+    return JSON.parse(value) as T
+  } catch (_error) {
+    return fallback
+  }
+}
+
+async function readApiResponse<T>(response: Response): Promise<T> {
+  const data = (await response.json()) as ApiResponseType<T>
+  if (!data.result) throw new Error(data.message)
+  return data.data as T
+}
+
 export class Uploader {
-  static KV_CHUNK_SIZE = 25 * 1024 * 1024
-  static MAX_KV_CHUNK_SIZE = 100 * 1024 * 1024
   static CHUNK_SIZE = 5 * 1024 * 1024
+  static MAX_UPLOAD_SIZE = 100 * 1024 * 1024
+
+  static async uploadStream(
+    payload: StreamUploadPayload,
+    onUpload?: UploadCallback,
+  ): Promise<ApiResponseType<FileUploadedType>> {
+    if (payload.size > this.MAX_UPLOAD_SIZE + 2 * 1024 * 1024) {
+      throw new Error(`文件大于 ${this.MAX_UPLOAD_SIZE / (1000 * 1000)}M`)
+    }
+
+    const session = await this.createSession(payload)
+    const expectedParts = Math.ceil(payload.size / session.partSize)
+    let uploaded = 0
+    let index = 0
+
+    for await (const part of this.streamParts(
+      payload.stream,
+      session.partSize,
+    )) {
+      index += 1
+      const partNumber = index
+      const bytes = part.byteLength
+
+      if (
+        session.uploadedParts.some((item) => item.partNumber === partNumber)
+      ) {
+        uploaded += bytes
+        this.emitProgress(uploaded, payload.size, bytes, onUpload)
+        continue
+      }
+
+      await this.uploadPart(
+        session.sessionId,
+        partNumber,
+        new Blob([part]),
+        uploaded,
+        payload.size,
+        onUpload,
+      )
+      uploaded += bytes
+      this.emitProgress(uploaded, payload.size, bytes, onUpload)
+    }
+
+    if (index !== expectedParts || uploaded !== payload.size) {
+      throw new Error('加密文件大小不匹配')
+    }
+
+    return await this.completeSession(session.sessionId)
+  }
 
   static async upload(
     formData: FormData,
     onUpload?: UploadCallback,
   ): Promise<ApiResponseType<FileUploadedType>> {
     const file: Blob | null = formData.get('file') as Blob
-    // 使用默认的上传
+    if (!file) throw new Error('分享内容为空')
+
     if (file.size <= this.CHUNK_SIZE) {
       const { data } = await axios.put('/files', formData, {
         onUploadProgress: onUpload,
       })
       return data as ApiResponseType<FileUploadedType>
     }
-    if (file.size <= this.KV_CHUNK_SIZE) {
-      const { objectId, sha } = await this.uploadWithChunk(file, onUpload)
-      formData.delete('file') // 移除 file
-      formData.append(
-        'fileInfo',
-        JSON.stringify({
-          objectId,
-          name: file.name,
-          type: file.type,
-          size: file.size,
-          sha,
-        }),
-      )
-      const { data } = await axios.put('/files', formData)
-      return data as ApiResponseType<FileUploadedType>
-    }
-    if (file.size <= this.MAX_KV_CHUNK_SIZE) {
-      const size = file.size
-      const chunkSize = file.size / this.KV_CHUNK_SIZE
-      const uploadHandler = this.createMergedProgressEventHandler(
-        size,
-        chunkSize,
-        onUpload,
-      )
-      const result = []
 
-      for (let i = 0; i < chunkSize; i++) {
-        const start = i * this.KV_CHUNK_SIZE
-        const end = Math.min(start + this.KV_CHUNK_SIZE, size)
-        const chunk = file.slice(start, end)
-        result.push(
-          await this.uploadWithChunk(chunk, (e) =>
-            uploadHandler.onUpload(e, i),
-          ),
-        )
-      }
-      const chunkInfo = result.map((d, i) => ({
-        ...d,
-        chunkId: i,
-      }))
-      uploadHandler.finished()
-      formData.delete('file') // 移除 file
-      formData.append(
-        'fileInfo',
-        JSON.stringify({
-          objectId: chunkInfo,
-          name: file.name,
-          type: file.type,
-          size: file.size,
-          sha: await this.getSHA(file),
-        }),
-      )
-      const { data } = await axios.put('/files', formData)
-      return data as ApiResponseType<FileUploadedType>
+    if (file.size <= this.MAX_UPLOAD_SIZE) {
+      return await this.uploadWithSession(formData, file, onUpload)
     }
-    throw new Error('建议使用 R2')
+
+    throw new Error(`文件大于 ${this.MAX_UPLOAD_SIZE / (1000 * 1000)}M`)
   }
 
-  static async uploadWithChunk(
-    blob: Blob,
+  private static async uploadWithSession(
+    formData: FormData,
+    file: Blob,
     onUpload?: UploadCallback,
-  ): Promise<{
-    objectId: string
-    sha: string
-  }> {
-    // 计算 md5
-    const sha = await this.getSHA(blob)
-    const uuid = getUserUUID()
-    const size = blob.size
-    const totalChunks = Math.ceil(blob.size / this.CHUNK_SIZE)
-    const chunks = new Array(totalChunks).fill(1).map((_, i) => ({
-      chunkId: i,
-      size:
-        i < totalChunks - 1
-          ? this.CHUNK_SIZE
-          : size + this.CHUNK_SIZE - this.CHUNK_SIZE * totalChunks,
-    }))
-    const chunkInfo = await this.getChunkInfo({
-      sha,
-      uuid,
-      size,
-      chunks,
+  ): Promise<ApiResponseType<FileUploadedType>> {
+    const hash = await this.getSHA(file)
+    const session = await this.createSession({
+      filename: this.getFilename(file),
+      type: file.type,
+      size: file.size,
+      hash,
+      duration: parseJsonField(formData.get('duration'), ''),
+      isEphemeral: parseJsonField(formData.get('isEphemeral'), false),
+      isEncrypted: parseJsonField(formData.get('isEncrypted'), false),
     })
+    const totalParts = Math.ceil(file.size / session.partSize)
+    let uploaded = 0
 
-    const uploadHandler = this.createMergedProgressEventHandler(
-      size,
-      totalChunks,
-      onUpload,
-    )
-
-    for (let i = 0; i < totalChunks; i++) {
-      const start = i * this.CHUNK_SIZE
-      const end = Math.min(start + this.CHUNK_SIZE, size)
-      const chunk = blob.slice(start, end)
-      if (chunkInfo.finished.find((d) => d.chunkId === i)) {
-        uploadHandler.onUpload(
-          {
-            loaded: end - start,
-            lengthComputable: true,
-            bytes: end - start,
-            total: end - start,
-            progress: 1,
-            upload: true,
-          },
-          i,
-        )
+    for (let index = 0; index < totalParts; index += 1) {
+      const partNumber = index + 1
+      if (
+        session.uploadedParts.some((part) => part.partNumber === partNumber)
+      ) {
+        const skippedSize = this.partSize(file, session.partSize, index)
+        uploaded += skippedSize
+        this.emitProgress(uploaded, file.size, skippedSize, onUpload)
         continue
       }
-      const formData = new FormData()
-      formData.append('chunk', chunk)
-      formData.append('chunkId', `${i}`)
-      formData.append('uuid', uuid)
-      formData.append('sha', sha)
-      await this.uploadChunk(formData, (e) => uploadHandler.onUpload(e, i))
+
+      const start = index * session.partSize
+      const end = Math.min(start + session.partSize, file.size)
+      const chunk = file.slice(start, end)
+      await this.uploadPart(
+        session.sessionId,
+        partNumber,
+        chunk,
+        uploaded,
+        file.size,
+        onUpload,
+      )
+      uploaded += chunk.size
+      this.emitProgress(uploaded, file.size, chunk.size, onUpload)
     }
 
-    uploadHandler.finished()
-    // 告知合并
-    const mergedResponse = await fetch('/files/chunks/merged', {
-      method: 'POST',
-      body: JSON.stringify({
-        sha,
-        uuid,
-      }),
-    })
-
-    const data: ApiResponseType<string> = await mergedResponse.json()
-    if (!data.result) {
-      throw new Error(data.message)
-    }
-    return { objectId: data.data!, sha }
+    return await this.completeSession(session.sessionId)
   }
 
-  private static createMergedProgressEventHandler(
-    size: number,
+  private static async createSession(payload: UploadSessionCreatePayload) {
+    const response = await fetch('/files/uploads', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    return readApiResponse<UploadSession>(response)
+  }
+
+  private static async uploadPart(
+    sessionId: string,
+    partNumber: number,
+    chunk: Blob,
+    uploadedBeforePart: number,
     total: number,
     onUpload?: UploadCallback,
   ) {
-    const progresses: Map<number, AxiosProgressEvent> = new Map()
-    let prevTotal = 0
+    const { data } = await axios.put<ApiResponseType<unknown>>(
+      `/files/uploads/${sessionId}/parts/${partNumber}`,
+      chunk,
+      {
+        headers: { 'Content-Type': 'application/octet-stream' },
+        onUploadProgress: (event) => {
+          this.emitProgress(
+            uploadedBeforePart + Math.min(event.loaded ?? 0, chunk.size),
+            total,
+            event.bytes ?? 0,
+            onUpload,
+          )
+        },
+      },
+    )
+    if (!data.result) throw new Error(data.message)
+  }
 
-    return {
-      onUpload: (e: AxiosProgressEvent, chunkId: number) => {
-        progresses.set(chunkId, e)
-        const totalLoaded = Array.from(progresses.values()).reduce(
-          (sum, loaded) => sum + loaded.loaded,
-          0,
-        )
-        if (onUpload) {
-          onUpload({
-            bytes: totalLoaded - prevTotal,
-            lengthComputable: true,
-            loaded: totalLoaded,
-            total: size,
-            progress: totalLoaded / size,
-            upload:
-              progresses.size === total &&
-              Array.from(progresses.values()).every((d) => d.upload),
-          })
+  private static async *streamParts(
+    stream: ReadableStream<Uint8Array>,
+    partSize: number,
+  ) {
+    const reader = stream.getReader()
+    let pending = new Uint8Array(0)
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        const combined = new Uint8Array(pending.byteLength + value.byteLength)
+        combined.set(pending)
+        combined.set(value, pending.byteLength)
+        let offset = 0
+        while (combined.byteLength - offset >= partSize) {
+          yield combined.slice(offset, offset + partSize)
+          offset += partSize
         }
-        prevTotal = totalLoaded
-      },
-      finished: () => {
-        if (onUpload) {
-          onUpload({
-            bytes: 0,
-            lengthComputable: true,
-            loaded: size,
-            total: size,
-            progress: 1,
-            upload: true,
-          })
-        }
-      },
+        pending = combined.slice(offset)
+      }
+      if (pending.byteLength) yield pending
+    } finally {
+      reader.releaseLock()
     }
   }
 
-  private static async uploadChunk(
-    formData: FormData,
+  private static async completeSession(
+    sessionId: string,
+  ): Promise<ApiResponseType<FileUploadedType>> {
+    const response = await fetch(`/files/uploads/${sessionId}/complete`, {
+      method: 'POST',
+    })
+    return {
+      result: true,
+      message: 'ok',
+      data: await readApiResponse<FileUploadedType>(response),
+    }
+  }
+
+  private static getFilename(file: Blob) {
+    return file instanceof File ? file.name : 'download'
+  }
+
+  private static partSize(file: Blob, partSize: number, index: number) {
+    const start = index * partSize
+    return Math.min(partSize, file.size - start)
+  }
+
+  private static emitProgress(
+    loaded: number,
+    total: number,
+    bytes: number,
     onUpload?: UploadCallback,
   ) {
-    return axios.put('/files/chunks', formData, {
-      onUploadProgress: onUpload,
+    onUpload?.({
+      bytes,
+      lengthComputable: true,
+      loaded,
+      total,
+      progress: total > 0 ? loaded / total : 1,
+      upload: loaded >= total,
     })
-  }
-
-  private static async getChunkInfo(
-    info: Omit<ChunkInfo, 'finished'>,
-  ): Promise<ChunkInfo> {
-    const response = await fetch('/files/chunks', {
-      method: 'POST',
-      body: JSON.stringify(info),
-    })
-
-    const data: ApiResponseType<ChunkInfo> = await response.json()
-
-    if (!data.result) {
-      throw new Error('获取分片信息失败')
-    }
-    return data.data!
   }
 
   private static async getSHA(blob: Blob): Promise<string> {

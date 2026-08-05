@@ -1,24 +1,21 @@
-import { useRef } from 'preact/hooks'
 import { DialogProps } from '@toolpad/core/useDialogs'
 import Box from '@mui/material/Box'
 // import DialogActions from '@mui/material/DialogActions'
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
-import zh from 'dayjs/locale/zh-cn'
-import QrCode from 'qrcode-svg'
+import { observer } from 'mobx-react-lite'
 
 import { copyToClipboard } from '../../../common.ts'
 import { BasicDialog } from './BasicDialog.tsx'
 import Typography from '@mui/material/Typography'
-import TextField from '@mui/material/TextField'
-import Button from '@mui/material/Button'
 
 import { Code } from './index.tsx'
+import { useTranslation } from '../../../i18n'
+import { ShareQrCopyPanel } from './ShareQrCopyPanel.tsx'
 
 dayjs.extend(relativeTime)
-dayjs.locale(zh)
 
-export function ShareDialog({
+export const ShareDialog = observer(function ShareDialog({
   open,
   onClose,
   payload,
@@ -30,26 +27,20 @@ export function ShareDialog({
     }
   }
 >) {
+  const i18n = useTranslation()
   const url = `${window.location.protocol}//${window.location.host}?code=${payload.code}`
-  const desc = `链接: ${url} 提取码: ${payload.code} ${payload.is_encrypted ? '' : ` SHA256 Hash 值: ${payload.hash}`} `
-  const qr = useRef(
-    new QrCode({
-      content: url,
-    }).svg(),
-  )
-
   const handleCopy = (str: string) => {
     copyToClipboard(str)
       .then(() => {
-        payload.message.success('复制成功')
+        payload.message.success(i18n.t('common.copySuccess'))
       })
       .catch(() => {
-        payload.message.success('复制失败')
+        payload.message.error(i18n.t('common.copyFailed'))
       })
   }
 
   return (
-    <BasicDialog open={open} onClose={onClose} title="分享">
+    <BasicDialog open={open} onClose={onClose} title={i18n.t('common.share')}>
       <Box>
         <Box
           className="relative"
@@ -68,49 +59,13 @@ export function ShareDialog({
         >
           <Code disabled length={6} value={payload.code} />
         </Box>
-        <Box
-          sx={{ mt: 2 }}
-          className="flex justify-center"
-          dangerouslySetInnerHTML={{ __html: qr.current }}
-        />
-
-        <Box sx={{ mt: 2 }}>
-          <TextField
-            multiline
-            fullWidth
-            rows={4}
-            value={desc}
-            disabled
-            sx={(theme) => ({
-              '& .MuiInputBase-root': {
-                color: theme.palette.text.primary,
-              },
-              textarea: {
-                WebkitTextFillColor: 'currentColor !important',
-              },
-            })}
-          />
-          <Button
-            variant="contained"
-            onClick={() => handleCopy(desc)}
-            sx={(theme) => ({
-              mt: 2,
-              pl: 4,
-              pr: 4,
-              [theme.breakpoints.down('sm')]: {
-                width: '100%',
-              },
-            })}
-          >
-            复制
-          </Button>
-        </Box>
+        <ShareQrCopyPanel shareUrl={url} message={payload.message} />
 
         <Box sx={{ mt: 2 }}>
           <Typography variant="body2" color="textDisabled">
-            原始分享 SHA256 Hash 值{' '}
+            {i18n.t('common.originalHashLabel')}{' '}
             <a target="_blank" href="https://www.lzltool.com/data-hash">
-              (校验工具)
+              ({i18n.t('common.verifyTool')})
             </a>
             {'：'}
           </Typography>
@@ -126,7 +81,9 @@ export function ShareDialog({
           </Typography>
           {}
           <Typography className="mt-1" variant="body2" color="textDisabled">
-            {payload.due_date ? '预计过期于：' : '永久有效'}
+            {payload.due_date
+              ? i18n.t('common.expiryEstimate')
+              : i18n.t('common.permanent')}
           </Typography>
           {payload.due_date && (
             <Typography className="mt-1" variant="body2">
@@ -137,4 +94,4 @@ export function ShareDialog({
       </Box>
     </BasicDialog>
   )
-}
+})
